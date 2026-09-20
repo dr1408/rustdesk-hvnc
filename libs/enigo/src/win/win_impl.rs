@@ -5,6 +5,7 @@ use self::winapi::um::winuser::*;
 use hbb_common::lazy_static::lazy_static;
 use hbb_common::tokio::sync::RwLock;
 use winapi;
+use winapi::um::processthreadsapi::GetCurrentThreadId;
 
 use crate::win::keycodes::*;
 use crate::{Key, KeyboardControllable, MouseButton, MouseControllable};
@@ -38,10 +39,59 @@ static mut MOVE_WINDOW: HWND = 0 as _;
 static mut MOVE_WINDOW_TYP: isize = 0;
 
 static mut GLOBAL_WND: HWND = 0 as _;
+static mut ATTACHED_INPUT_THREAD: DWORD = 0;
+static mut CLICK_TARGET: HWND = 0 as _;
+
 
 ///
 pub fn get_gbl_wnd() -> HWND {
     unsafe { GLOBAL_WND }
+}
+
+
+struct ChildHit {
+    point: POINT,
+    hwnd: HWND,
+    area: i64,
+    render_child: bool,
+}
+
+unsafe extern "system" fn find_child_at_point(hwnd: HWND, data: LPARAM) -> BOOL {
+    let hit = &mut *(data as *mut ChildHit);
+    let mut rect: RECT = zeroed();
+    if GetWindowRect(hwnd, &mut rect) == 0 || PtInRect(&rect, hit.point) == 0 {
+        return TRUE;
+    }
+    let class = print_wnd_name(hwnd);
+    let width = (rect.right - rect.left).max(1) as i64;
+    let height = (rect.bottom - rect.top).max(1) as i64;
+    let area = width * height;
+    let is_render_child = class == "Chrome_RenderWidgetHostHWND";
+    if (is_render_child && !hit.render_child)
+        || (is_render_child == hit.render_child && area < hit.area)
+    {
+        hit.hwnd = hwnd;
+        hit.area = area;
+        hit.render_child = is_render_child;
+    }
+    TRUE
+}
+
+fn child_at_screen_point(parent: HWND, point: POINT) -> HWND {
+    unsafe {
+        let mut hit = ChildHit {
+            point,
+            hwnd: ptr::null_mut(),
+            area: i64::MAX,
+            render_child: false,
+        };
+        EnumChildWindows(
+            parent,
+            Some(find_child_at_point),
+            &mut hit as *mut ChildHit as LPARAM,
+        );
+        hit.hwnd
+    }
 }
 
 fn print_wnd_name(wnd: HWND) -> String {
@@ -106,6 +156,15 @@ fn mouse_event(flags: u32, data: u32, dx: i32, dy: i32) -> DWORD {
             MOVE => {
                 X = dx;
                 Y = dy;
+
+                let mut move_point = POINT { x: dx, y: dy };
+                let move_wnd = WindowFromPoint(move_point);
+                if !move_wnd.is_null() {
+                    ScreenToClient(move_wnd, &mut move_point);
+                    let move_lparam = lparam_from_point(move_point);
+                    let move_flags = if MOUSE_DOWN { MK_LBUTTON } else { 0 };
+                    PostMessageA(move_wnd, WM_MOUSEMOVE, move_flags, move_lparam);
+                }
 
                 // if !MOUSE_DOWN {
                 //     return 1;
@@ -196,6 +255,7 @@ fn mouse_event(flags: u32, data: u32, dx: i32, dy: i32) -> DWORD {
             _ => {
                 let mut point = POINT { x: X, y: Y };
                 let mut wnd = WindowFromPoint(point);
+                let screen_point = point;
                 let screen_lparam = lparam_from_point(point);
 
                 let mut curr_wnd = wnd;
@@ -209,6 +269,48 @@ fn mouse_event(flags: u32, data: u32, dx: i32, dy: i32) -> DWORD {
                     }
                 }
 
+
+                // Chromium and other DirectComposition apps place the real
+                // interactive surface below an invisible compositor child.
+                // Route posted input to its parent, as those children reject
+                // window messages even though they receive hit testing.
+                if !client_wnd.is_null() && IsWindow(client_wnd) != 0 {
+                    while GetWindowLongA(client_wnd, GWL_STYLE) as u32 & WS_CHILD != 0
+                        && GetWindowLongA(client_wnd, GWL_EXSTYLE) as u32 & WS_EX_NOREDIRECTIONBITMAP != 0
+                    {
+                        let parent = GetParent(client_wnd);
+                        if parent.is_null() || parent == client_wnd {
+                            break;
+                        }
+                        client_wnd = parent;
+                    }
+                    point = screen_point;
+                    ScreenToClient(client_wnd, &mut point);
+                }
+
+                // ChildWindowFromPoint can report a Chromium popup itself even when an interactive descendant owns the actual menu item.
+                if !wnd.is_null() && (client_wnd.is_null() || client_wnd == wnd) {
+                    let child_wnd = child_at_screen_point(wnd, screen_point);
+                    if !child_wnd.is_null() {
+                        client_wnd = child_wnd;
+                        point = screen_point;
+                        ScreenToClient(client_wnd, &mut point);
+                        if print_wnd_name(client_wnd) == "Intermediate D3D Window" {
+                            let compositor = client_wnd;
+                            let parent = GetParent(compositor);
+                            if !parent.is_null() && parent != compositor {
+                                client_wnd = parent;
+                                point = screen_point;
+                                ScreenToClient(client_wnd, &mut point);
+                            }
+                        }
+                    }
+                }
+
+                if client_wnd.is_null() {
+                    client_wnd = wnd;
+                }
+
                 GLOBAL_WND = wnd;
 
                 let client_lparam = lparam_from_point(point);
@@ -217,6 +319,29 @@ fn mouse_event(flags: u32, data: u32, dx: i32, dy: i32) -> DWORD {
                     MOUSEEVENTF_LEFTDOWN => {
                         MOUSE_DOWN = true;
                         MOVE_WINDOW = wnd;
+
+                        let popup_window = (GetWindowLongA(wnd, GWL_STYLE) as u32 & WS_POPUP) != 0;
+                        let current_thread = GetCurrentThreadId();
+                        let target_thread = GetWindowThreadProcessId(wnd, ptr::null_mut());
+                        let attach_result = if current_thread != target_thread {
+                            AttachThreadInput(current_thread, target_thread, TRUE)
+                        } else {
+                            TRUE
+                        };
+                        if attach_result != 0 {
+                            ATTACHED_INPUT_THREAD = target_thread;
+                        }
+                        if !popup_window {
+                            SetActiveWindow(wnd);
+                            SetFocus(client_wnd);
+                            SetCapture(client_wnd);
+                            SendMessageA(
+                                client_wnd,
+                                WM_MOUSEACTIVATE,
+                                wnd as usize,
+                                ((WM_LBUTTONDOWN as isize) << 16) | HTCLIENT as isize,
+                            );
+                        }
                         println!("set move window {}", print_wnd_name(wnd));
                         // MOVE_WINDOW_TYP = SendMessageA(wnd, WM_NCHITTEST, 0, screen_lparam);
 
@@ -249,13 +374,35 @@ fn mouse_event(flags: u32, data: u32, dx: i32, dy: i32) -> DWORD {
                         } else {
                             client_lparam
                         };
+                        let start_window = wnd_cls_name(wnd) == "Start";
+                        let synchronous_click = start_window || popup_window;
+                        let mut click_target = client_wnd;
+                        if click_target.is_null() || IsWindow(click_target) == 0 {
+                            click_target = wnd;
+                        }
+                        CLICK_TARGET = click_target;
                         if is_dbl_clk(MOUSEEVENTF_LEFTDOWN, point.x, point.y) {
-                            PostMessageA(client_wnd, WM_LBUTTONDBLCLK, MK_LBUTTON, lparam);
+                            if synchronous_click {
+                                SendMessageA(click_target, WM_LBUTTONDBLCLK, MK_LBUTTON, lparam)
+                            } else {
+                                PostMessageA(click_target, WM_LBUTTONDBLCLK, MK_LBUTTON, lparam) as isize
+                            };
                             LAST_MOUSE_DOWN = 0;
                             LAST_MOUSE_DOWN_X_Y = (0, 0);
                         } else {
                             println!("click {}", wnd_cls_name(wnd));
-                            PostMessageA(client_wnd, WM_LBUTTONDOWN, 0, lparam);
+                            let result = if synchronous_click {
+                                SendMessageA(click_target, WM_LBUTTONDOWN, MK_LBUTTON, lparam) as i32
+                            } else {
+                                PostMessageA(click_target, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+                            };
+                            if result == 0 && click_target != wnd && IsWindow(wnd) != 0 {
+                                let fallback_result = PostMessageA(wnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam);
+                                if fallback_result != 0 {
+                                    click_target = wnd;
+                                    CLICK_TARGET = wnd;
+                                }
+                            }
                             LAST_MOUSE_DOWN = MOUSEEVENTF_LEFTDOWN;
                             LAST_MOUSE_DOWN_X_Y = (point.x, point.y);
                         }
@@ -273,18 +420,11 @@ fn mouse_event(flags: u32, data: u32, dx: i32, dy: i32) -> DWORD {
                         MOUSE_DOWN = false;
                         MOVE_WINDOW = 0 as _;
 
-                        if wnd_cls_name(wnd) != "SysTreeView32" {
+                        let popup_window = (GetWindowLongA(wnd, GWL_STYLE) as u32 & WS_POPUP) != 0;
+                        if !popup_window && wnd_cls_name(wnd) != "SysTreeView32" {
                             let ret = SendMessageA(wnd, WM_NCHITTEST, 0, screen_lparam);
                             match ret {
-                                HTTRANSPARENT => {
-                                    SetWindowLongPtrA(
-                                        wnd,
-                                        GWL_STYLE,
-                                        GetWindowLongA(wnd, GWL_STYLE) as isize
-                                            | WS_DISABLED as isize,
-                                    );
-                                    SendMessageA(wnd, WM_NCHITTEST, 0, screen_lparam);
-                                }
+                                HTTRANSPARENT => {}
                                 HTCLOSE => {
                                     PostMessageA(wnd, WM_CLOSE, 0, 0);
                                 }
@@ -311,7 +451,31 @@ fn mouse_event(flags: u32, data: u32, dx: i32, dy: i32) -> DWORD {
                             }
                         }
 
-                        PostMessageA(client_wnd, WM_LBUTTONUP, 0, client_lparam);
+                        let mut release_target = CLICK_TARGET;
+                        if release_target.is_null() || IsWindow(release_target) == 0 {
+                            release_target = client_wnd;
+                        }
+                        let release_start = wnd_cls_name(release_target) == "Start";
+                        let release_popup =
+                            (GetWindowLongA(release_target, GWL_STYLE) as u32 & WS_POPUP) != 0;
+                        if release_start || release_popup {
+                            SendMessageA(release_target, WM_LBUTTONUP, 0, client_lparam) as i32
+                        } else {
+                            PostMessageA(release_target, WM_LBUTTONUP, 0, client_lparam)
+                        };
+                        CLICK_TARGET = 0 as _;
+                        let capture_before_release = GetCapture();
+                        if capture_before_release == client_wnd {
+                            ReleaseCapture();
+                        }
+                        let detached_thread = ATTACHED_INPUT_THREAD;
+                        if detached_thread != 0 {
+                            let result = AttachThreadInput(GetCurrentThreadId(), detached_thread, FALSE);
+                            ATTACHED_INPUT_THREAD = 0;
+                            result
+                        } else {
+                            TRUE
+                        };
                     }
                     MOUSEEVENTF_MIDDLEUP => {
                         PostMessageA(client_wnd, WM_MBUTTONUP, 0, client_lparam);
@@ -345,49 +509,26 @@ fn mouse_event(flags: u32, data: u32, dx: i32, dy: i32) -> DWORD {
     return 1;
 }
 
-fn keybd_event(mut flags: u32, vk: u16, scan: u16) -> DWORD {
-    // let mut scan = scan;
-    // unsafe {
-    //     // https://github.com/rustdesk/rustdesk/issues/366
-    //     if scan == 0 {
-    //         if LAYOUT.is_null() {
-    //             let current_window_thread_id =
-    //                 GetWindowThreadProcessId(GetForegroundWindow(),
-    // std::ptr::null_mut());             LAYOUT =
-    // GetKeyboardLayout(current_window_thread_id);         }
-    //         scan = MapVirtualKeyExW(vk as _, 0, LAYOUT) as _;
-    //     }
-    // }
-
-    // if flags & KEYEVENTF_UNICODE == 0 {
-    //     if scan >> 8 == 0xE0 || scan >> 8 == 0xE1 {
-    //         flags |= winapi::um::winuser::KEYEVENTF_EXTENDEDKEY;
-    //     }
-    // }
-    // let mut union: INPUT_u = unsafe { std::mem::zeroed() };
-    // unsafe {
-    //     *union.ki_mut() = KEYBDINPUT {
-    //         wVk: vk,
-    //         wScan: scan,
-    //         dwFlags: flags,
-    //         time: 0,
-    //         dwExtraInfo: ENIGO_INPUT_EXTRA_VALUE,
-    //     };
-    // }
-    // let mut inputs = [INPUT {
-    //     type_: INPUT_KEYBOARD,
-    //     u: union,
-    // }; 1];
-    // unsafe {
-    //     SendInput(
-    //         inputs.len() as UINT,
-    //         inputs.as_mut_ptr(),
-    //         size_of::<INPUT>() as c_int,
-    //     )
-    // }
-    // println!("{flags} {vk} {scan}");
-
-    return 1;
+fn keybd_event(flags: u32, vk: u16, scan: u16) -> DWORD {
+    let mut union: INPUT_u = unsafe { std::mem::zeroed() };
+    unsafe {
+        *union.ki_mut() = KEYBDINPUT {
+            wVk: vk,
+            wScan: scan,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: ENIGO_INPUT_EXTRA_VALUE,
+        };
+        let mut inputs = [INPUT {
+            type_: INPUT_KEYBOARD,
+            u: union,
+        }; 1];
+        SendInput(
+            inputs.len() as UINT,
+            inputs.as_mut_ptr(),
+            size_of::<INPUT>() as c_int,
+        )
+    }
 }
 
 fn get_error() -> String {

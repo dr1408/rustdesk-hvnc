@@ -1232,10 +1232,65 @@ fn sync_modifiers(en: &mut Enigo, key_event: &KeyEvent, _to_release: &mut Vec<Ke
     }
 }
 
+fn simulate_rdev_key(key: Key, down: bool) -> bool {
+    #[cfg(windows)]
+    {
+        let rkey = match key {
+            Key::Alt | Key::Option => RdevKey::Alt,
+            Key::Backspace => RdevKey::Backspace,
+            Key::CapsLock => RdevKey::CapsLock,
+            Key::Control => RdevKey::ControlLeft,
+            Key::RightControl => RdevKey::ControlRight,
+            Key::Delete => RdevKey::Delete,
+            Key::DownArrow => RdevKey::DownArrow,
+            Key::End => RdevKey::End,
+            Key::Escape => RdevKey::Escape,
+            Key::F1 => RdevKey::F1, Key::F2 => RdevKey::F2, Key::F3 => RdevKey::F3,
+            Key::F4 => RdevKey::F4, Key::F5 => RdevKey::F5, Key::F6 => RdevKey::F6,
+            Key::F7 => RdevKey::F7, Key::F8 => RdevKey::F8, Key::F9 => RdevKey::F9,
+            Key::F10 => RdevKey::F10, Key::F11 => RdevKey::F11, Key::F12 => RdevKey::F12,
+            Key::Home => RdevKey::Home,
+            Key::LeftArrow => RdevKey::LeftArrow,
+            Key::Meta | Key::Command | Key::Super | Key::Windows => RdevKey::MetaLeft,
+            Key::RWin => RdevKey::MetaRight,
+            Key::PageDown => RdevKey::PageDown, Key::PageUp => RdevKey::PageUp,
+            Key::Return => RdevKey::Return,
+            Key::RightArrow => RdevKey::RightArrow,
+            Key::Shift => RdevKey::ShiftLeft, Key::RightShift => RdevKey::ShiftRight,
+            Key::Space => RdevKey::Space, Key::Tab => RdevKey::Tab, Key::UpArrow => RdevKey::UpArrow,
+            Key::RightAlt => RdevKey::AltGr,
+            _ => return false,
+        };
+        let event = if down { EventType::KeyPress(rkey) } else { EventType::KeyRelease(rkey) };
+        return rdev::simulate(&event).is_ok();
+    }
+    #[cfg(not(windows))]
+    { let _ = (key, down); false }
+}
+
+#[cfg(windows)]
+fn sync_modifiers_windows(evt: &KeyEvent, to_release: &mut Vec<Key>) {
+    if !evt.down {
+        return;
+    }
+    for ck in &evt.modifiers {
+        if let Some(key) = control_key_value_to_key(ck.value()) {
+            if simulate_rdev_key(key, true) {
+                to_release.push(key);
+            }
+        }
+    }
+}
+
 fn process_control_key(en: &mut Enigo, ck: &EnumOrUnknown<ControlKey>, down: bool) {
-    if let Some(key) = control_key_value_to_key(ck.value()) {
+    let value = ck.value();
+    if let Some(key) = control_key_value_to_key(value) {
+        #[cfg(windows)]
+        if simulate_rdev_key(key, down) {
+            return;
+        }
         if down {
-            en.key_down(key).ok();
+            let _ = en.key_down(key);
         } else {
             en.key_up(key);
         }
@@ -1247,19 +1302,43 @@ fn need_to_uppercase(en: &mut Enigo) -> bool {
     get_modifier_state(Key::Shift, en) || get_modifier_state(Key::CapsLock, en)
 }
 
-fn process_chr(en: &mut Enigo, chr: u32, down: bool) {
+fn has_hotkey_modifiers(evt: &KeyEvent) -> bool {
+    evt.modifiers.iter().any(|ck| matches!(ck.value(),
+        x if x == ControlKey::Control.value()
+            || x == ControlKey::RControl.value()
+            || x == ControlKey::Meta.value()
+            || x == ControlKey::RWin.value()
+            || x == ControlKey::Alt.value()
+            || x == ControlKey::RAlt.value()
+    ))
+}
+
+fn process_chr(en: &mut Enigo, chr: u32, down: bool, hotkey: bool) {
     let key = char_value_to_key(chr);
 
+    #[cfg(windows)]
+    if !hotkey || hotkey {
+        if down {
+            if let Ok(c) = char::try_from(chr) {
+                let result = rdev::simulate_char(c, true);
+                if result.is_ok() {
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
     if down {
-        if en.key_down(key).is_ok() {
-        } else {
+        let result = en.key_down(key.clone());
+        if result.is_err() {
             if let Ok(chr) = char::try_from(chr) {
                 let mut s = chr.to_string();
                 if need_to_uppercase(en) {
                     s = s.to_uppercase();
                 }
                 en.key_sequence(&s);
-            };
+            }
         }
     } else {
         en.key_up(key);
@@ -1276,10 +1355,17 @@ fn process_seq(en: &mut Enigo, sequence: &str) {
     en.key_sequence(&sequence);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 fn release_keys(en: &mut Enigo, to_release: &Vec<Key>) {
     for key in to_release {
         en.key_up(key.clone());
+    }
+}
+
+#[cfg(windows)]
+fn release_keys(_en: &mut Enigo, to_release: &Vec<Key>) {
+    for key in to_release {
+        simulate_rdev_key(key.clone(), false);
     }
 }
 
@@ -1291,7 +1377,6 @@ fn record_pressed_key(record_key: KeysDown, down: bool) {
         key_down.remove(&record_key);
     }
 }
-
 fn is_function_key(ck: &EnumOrUnknown<ControlKey>) -> bool {
     let mut res = false;
     if ck.value() == ControlKey::CtrlAltDel.value() {
@@ -1315,6 +1400,9 @@ fn legacy_keyboard_mode(evt: &KeyEvent) {
     let mut to_release: Vec<Key> = Vec::new();
 
     let mut en = ENIGO.lock().unwrap();
+    #[cfg(windows)]
+    sync_modifiers_windows(&evt, &mut to_release);
+    #[cfg(not(windows))]
     sync_modifiers(&mut en, &evt, &mut to_release);
 
     let down = evt.down;
@@ -1330,7 +1418,7 @@ fn legacy_keyboard_mode(evt: &KeyEvent) {
         Some(key_event::Union::Chr(chr)) => {
             let record_key = chr as u64 + KEY_CHAR_START;
             record_pressed_key(KeysDown::EnigoKey(record_key), down);
-            process_chr(&mut en, chr, down)
+            process_chr(&mut en, chr, down, has_hotkey_modifiers(evt))
         }
         Some(key_event::Union::Unicode(chr)) => process_unicode(&mut en, chr),
         Some(key_event::Union::Seq(ref seq)) => process_seq(&mut en, seq),
@@ -1487,10 +1575,12 @@ fn is_legacy_mode(evt: &KeyEvent) -> bool {
     evt.mode.enum_value_or(KeyboardMode::Legacy) == KeyboardMode::Legacy
 }
 
+
 pub fn handle_key_(evt: &KeyEvent) {
     if EXITING.load(Ordering::SeqCst) {
         return;
     }
+
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let mut _lock_mode_handler = None;
@@ -1526,6 +1616,7 @@ pub fn handle_key_(evt: &KeyEvent) {
         _ => {}
     };
 
+
     match evt.mode.enum_value() {
         Ok(KeyboardMode::Map) => {
             map_keyboard_mode(evt);
@@ -1543,7 +1634,6 @@ pub fn handle_key_(evt: &KeyEvent) {
 async fn lock_screen_2() {
     lock_screen().await;
 }
-
 #[tokio::main(flavor = "current_thread")]
 async fn send_sas() -> ResultType<()> {
     let mut stream = crate::ipc::connect(1000, crate::POSTFIX_SERVICE).await?;

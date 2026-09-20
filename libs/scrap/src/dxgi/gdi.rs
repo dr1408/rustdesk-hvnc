@@ -14,18 +14,17 @@ use winapi::um::winuser::GetWindowDC;
 use winapi::um::winuser::GetWindowInfo;
 use winapi::um::winuser::GetWindowLongA;
 use winapi::um::winuser::GetWindowTextA;
+use winapi::um::winuser::GetClassNameA;
+use winapi::um::winuser::GetWindowThreadProcessId;
 use winapi::um::winuser::IsWindowVisible;
-use winapi::um::winuser::SetWindowLongA;
 use winapi::um::winuser::GWL_EXSTYLE;
-use winapi::um::winuser::GW_HWNDPREV;
-use winapi::um::winuser::PW_CLIENTONLY;
-use winapi::um::winuser::WINDOWINFO;
-use winapi::um::winuser::WS_EX_COMPOSITED;
+use winapi::um::winuser::GWL_STYLE;
+use winapi::um::winuser::PW_RENDERFULLCONTENT;
+
 use winapi::um::winuser::{GetWindowRect, PrintWindow};
 use winapi::{
-    shared::windef::{HBITMAP, HDC, HDESK, HWND, RECT},
+    shared::{minwindef::{BOOL, LPARAM, TRUE}, windef::{HBITMAP, HDC, HDESK, HWND, RECT}},
     um::{
-        errhandlingapi::GetLastError,
         wingdi::{
             BitBlt,
             CreateCompatibleBitmap,
@@ -46,13 +45,21 @@ use winapi::{
         },
         winnt::GENERIC_ALL,
         winuser::{
-            CloseDesktop, CreateDesktopA, GetDC, GetTopWindow, GetWindow, OpenDesktopA,
-            SetThreadDesktop, GW_HWNDLAST,
+            CloseDesktop, CreateDesktopA, EnumDesktopWindows, GetDC, GetWindow,
+            OpenDesktopA, SetThreadDesktop, GW_OWNER,
         },
     },
 };
 
 const PIXEL_WIDTH: i32 = 4;
+
+
+unsafe extern "system" fn collect_desktop_window(wnd: HWND, data: LPARAM) -> BOOL {
+    let windows = &mut *(data as *mut Vec<HWND>);
+    windows.push(wnd);
+    TRUE
+}
+
 
 pub struct CapturerGDI {
     screen_dc: HDC,
@@ -170,7 +177,8 @@ impl CapturerGDI {
                 println!("SelectObject");
             }
 
-            if PrintWindow(wnd, dc_window, 0) != 0 {
+            let print_result = PrintWindow(wnd, dc_window, PW_RENDERFULLCONTENT);
+            if print_result != 0 {
                 if 0 == BitBlt(
                     self.screen_dc,
                     rect.left,
@@ -200,46 +208,24 @@ impl CapturerGDI {
             if 0 == IsWindowVisible(wnd) {
                 return true;
             }
-
             self.paint_window(wnd);
-
-            let style = GetWindowLongA(wnd, GWL_EXSTYLE);
-            SetWindowLongA(wnd, GWL_EXSTYLE, style | WS_EX_COMPOSITED as i32);
-
-            let mut version: OSVERSIONINFOA = mem::zeroed();
-            version.dwOSVersionInfoSize = mem::size_of::<OSVERSIONINFOA>() as _;
-
-            GetVersionExA(&mut version);
-            if version.dwMajorVersion < 6 {
-                self.enum_windows_top_to_down(wnd);
-            }
-
             true
         }
     }
 
-    fn enum_windows_top_to_down(&self, owner: HWND) {
+    fn enum_windows(&self) {
         unsafe {
-            let mut current_window = GetTopWindow(owner);
-            if current_window.is_null() {
+            let mut windows = Vec::<HWND>::new();
+            let result = EnumDesktopWindows(
+                self.desktop,
+                Some(collect_desktop_window),
+                &mut windows as *mut Vec<HWND> as LPARAM,
+            );
+            if result == 0 {
                 return;
             }
-
-            current_window = GetWindow(current_window, GW_HWNDLAST);
-
-            if current_window.is_null() {
-                return;
-            }
-
-            loop {
-                if !self.enum_windows_print(current_window) {
-                    break;
-                }
-
-                current_window = GetWindow(current_window, GW_HWNDPREV);
-                if current_window.is_null() {
-                    break;
-                }
+            for wnd in windows.into_iter().rev() {
+                self.enum_windows_print(wnd);
             }
         }
     }
@@ -263,7 +249,7 @@ impl CapturerGDI {
             // }
             // SetThreadDesktop(self.desktop);
 
-            self.enum_windows_top_to_down(ptr::null_mut());
+            self.enum_windows();
             // self.paint_window(GetDesktopWindow());
 
             let stride = self.width * PIXEL_WIDTH;

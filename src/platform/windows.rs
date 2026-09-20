@@ -15,6 +15,7 @@ use hbb_common::{
     sleep, timeout, tokio,
 };
 use std::process::{Command, Stdio};
+use std::cell::Cell;
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -44,7 +45,8 @@ use winapi::{
         winbase::*,
         wingdi::*,
         winnt::{
-            TokenElevation, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
+            TokenElevation, ES_AWAYMODE_REQUIRED,
+            GENERIC_ALL, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
             ES_SYSTEM_REQUIRED, HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, TOKEN_ELEVATION,
             TOKEN_QUERY,
         },
@@ -664,28 +666,51 @@ lazy_static::lazy_static! {
     static ref SUPPRESS: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 }
 
+thread_local! {
+    static HVNC_DESKTOP_HANDLE: Cell<HDESK> = Cell::new(std::ptr::null_mut());
+}
+
+
 pub fn desktop_changed() -> bool {
     unsafe { inputDesktopSelected() == FALSE }
 }
 
 pub fn try_change_desktop() -> bool {
-    return false;
-    unsafe {
-        if inputDesktopSelected() == FALSE {
-            let res = selectInputDesktop() == TRUE;
-            if !res {
-                let mut s = SUPPRESS.lock().unwrap();
-                if s.elapsed() > std::time::Duration::from_secs(3) {
-                    log::error!("Failed to switch desktop: {}", get_error());
-                    *s = Instant::now();
-                }
-            } else {
-                log::info!("Desktop switched");
-            }
-            return res;
+    HVNC_DESKTOP_HANDLE.with(|handle| {
+        if !handle.get().is_null() {
+            return true;
         }
-    }
-    return false;
+
+        unsafe {
+            let mut desktop = OpenDesktopA(
+                config::DESKTOP_NAME.as_ptr() as _,
+                0,
+                TRUE,
+                GENERIC_ALL,
+            );
+            if desktop.is_null() {
+                desktop = CreateDesktopA(
+                    config::DESKTOP_NAME.as_ptr() as _,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    GENERIC_ALL,
+                    std::ptr::null_mut(),
+                );
+                if desktop.is_null() {
+                    return false;
+                }
+            }
+
+            if SetThreadDesktop(desktop) == FALSE {
+                CloseDesktop(desktop);
+                return false;
+            }
+
+            handle.set(desktop);
+            true
+        }
+    })
 }
 
 fn get_error() -> String {
